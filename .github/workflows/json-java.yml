@@ -6,7 +6,7 @@ on:
       duration_seconds:
         description: "Maximum fuzzing duration in seconds"
         required: true
-        default: "180"
+        default: "1800"
         type: string
       fork_processes:
         description: "Parallel libFuzzer fork-mode processes"
