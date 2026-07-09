@@ -1,0 +1,365 @@
+name: JSON-java Jazzer fuzzing+coverage
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: "Maximum fuzzing duration in seconds"
+        required: true
+        default: "180"
+        type: string
+      fork_processes:
+        description: "Parallel libFuzzer fork-mode processes"
+        required: true
+        default: "3"
+        type: string
+      seed:
+        description: "libFuzzer random seed"
+        required: true
+        default: "1"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz-and-coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      PROJECT: json-java
+      TARGET: JsonJavaFuzzer
+
+    steps:
+      - name: Checkout experiment repository
+        uses: actions/checkout@v4
+        with:
+          path: experiment
+
+      - name: Checkout OSS-Fuzz
+        uses: actions/checkout@v4
+        with:
+          repository: google/oss-fuzz
+          path: oss-fuzz
+
+      - name: Patch json-java build.sh to create seed corpus
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          build_sh = Path("oss-fuzz/projects/json-java/build.sh")
+          text = build_sh.read_text()
+
+          seed_block = r'''
+          # Create an initial seed corpus for JsonJavaFuzzer from JSON-java's
+          # upstream JSON test resources.
+          python3 - <<'PY_SEED'
+          import os
+          from pathlib import Path
+          from zipfile import ZipFile, ZIP_DEFLATED
+
+          resources = Path("src/test/resources")
+          json_files = sorted(resources.glob("*.json"))
+
+          if not json_files:
+              raise SystemExit("No JSON files found in src/test/resources/*.json")
+
+          out = Path(os.environ["OUT"]) / "JsonJavaFuzzer_seed_corpus.zip"
+
+          with ZipFile(out, "w", ZIP_DEFLATED) as corpus:
+              for json_file in json_files:
+                  corpus.write(json_file, json_file.name)
+
+          print(f"Created {out} with {len(json_files)} JSON seed files")
+          PY_SEED
+
+          '''
+
+          marker = "cd src/main/java"
+
+          if "JsonJavaFuzzer_seed_corpus.zip" not in text:
+              if marker not in text:
+                  raise SystemExit("Could not find insertion point in build.sh")
+              text = text.replace(marker, seed_block + "\n" + marker, 1)
+              build_sh.write_text(text)
+
+          print("===== patched build.sh =====")
+          print(build_sh.read_text())
+          PY
+
+      - name: Build OSS-Fuzz image
+        run: |
+          set -euo pipefail
+          cd oss-fuzz
+          python3 infra/helper.py build_image --pull "$PROJECT"
+
+      - name: Build json-java fuzzers
+        run: |
+          set -euo pipefail
+          cd oss-fuzz
+          python3 infra/helper.py build_fuzzers --clean "$PROJECT"
+
+      - name: Verify seed corpus zip
+        run: |
+          set -euo pipefail
+
+          SEED_ZIP="$GITHUB_WORKSPACE/oss-fuzz/build/out/$PROJECT/${TARGET}_seed_corpus.zip"
+
+          if [ ! -s "$SEED_ZIP" ]; then
+            echo "Seed corpus zip was not created or is empty: $SEED_ZIP"
+            exit 1
+          fi
+
+          json_count=$(python3 - <<PY
+          from zipfile import ZipFile
+          seed_zip = "$SEED_ZIP"
+
+          with ZipFile(seed_zip) as z:
+              names = [n for n in z.namelist() if n.endswith(".json")]
+              print(len(names))
+          PY
+          )
+
+          echo "JSON seed count: $json_count"
+
+          if [ "$json_count" -eq 0 ]; then
+            echo "No .json files were added to the seed corpus. Stopping."
+            exit 1
+          fi
+
+          unzip -l "$SEED_ZIP"
+
+      - name: Check json-java build
+        run: |
+          set -euo pipefail
+          cd oss-fuzz
+          python3 infra/helper.py check_build "$PROJECT" "$TARGET"
+
+      - name: Prepare initial live corpus and crash directory
+        run: |
+          set -euo pipefail
+
+          rm -rf "$GITHUB_WORKSPACE/corpus"
+          rm -rf "$GITHUB_WORKSPACE/crashes"
+          rm -rf "$GITHUB_WORKSPACE/coverage-html"
+
+          mkdir -p "$GITHUB_WORKSPACE/corpus/live"
+          mkdir -p "$GITHUB_WORKSPACE/corpus/minimized"
+          mkdir -p "$GITHUB_WORKSPACE/crashes"
+          mkdir -p "$GITHUB_WORKSPACE/coverage-html"
+
+          SEED_ZIP="$GITHUB_WORKSPACE/oss-fuzz/build/out/$PROJECT/${TARGET}_seed_corpus.zip"
+
+          unzip -q "$SEED_ZIP" -d "$GITHUB_WORKSPACE/corpus/live"
+
+          echo "Initial live corpus count:"
+          find "$GITHUB_WORKSPACE/corpus/live" -maxdepth 1 -type f | wc -l
+
+      - name: Run Jazzer/libFuzzer fork-mode fuzzing for 5h
+        id: fuzz
+        continue-on-error: true
+        run: |
+          set +e
+
+          OUT_DIR="$GITHUB_WORKSPACE/oss-fuzz/build/out/$PROJECT"
+          LIVE_CORPUS="$GITHUB_WORKSPACE/corpus/live"
+          CRASH_DIR="$GITHUB_WORKSPACE/crashes"
+
+          docker run \
+            --platform linux/amd64 \
+            --rm \
+            -v "$OUT_DIR:/out" \
+            -v "$LIVE_CORPUS:/corpus" \
+            -v "$CRASH_DIR:/crashes" \
+            gcr.io/oss-fuzz-base/base-runner:latest \
+            /bin/bash -lc "
+              set +e
+
+              echo '===== target ====='
+              ls -lh /out/$TARGET
+
+              echo '===== initial corpus count ====='
+              find /corpus -maxdepth 1 -type f | wc -l
+
+              echo '===== starting Jazzer/libFuzzer fork-mode fuzzing ====='
+              /out/$TARGET \
+                /corpus \
+                -fork=${{ inputs.fork_processes }} \
+                -ignore_crashes=1 \
+                -ignore_timeouts=1 \
+                -ignore_ooms=1 \
+                -max_total_time=${{ inputs.duration_seconds }} \
+                -seed=${{ inputs.seed }} \
+                -artifact_prefix=/crashes/ \
+                -print_final_stats=1 \
+                -timeout=60 \
+                -rss_limit_mb=6144
+
+              status=\$?
+              echo \"jazzer_exit_status=\$status\"
+              exit \$status
+            "
+
+          status=$?
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+
+          echo "Generated live corpus count after fuzzing:"
+          find "$LIVE_CORPUS" -maxdepth 1 -type f | wc -l
+
+          echo "Crash/failure artifacts:"
+          find "$CRASH_DIR" -maxdepth 1 -type f -print | sort || true
+
+          exit 0
+
+      - name: Minimize generated live corpus
+        id: minimize
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e
+
+          OUT_DIR="$GITHUB_WORKSPACE/oss-fuzz/build/out/$PROJECT"
+          LIVE_CORPUS="$GITHUB_WORKSPACE/corpus/live"
+          MIN_CORPUS="$GITHUB_WORKSPACE/corpus/minimized"
+          CRASH_DIR="$GITHUB_WORKSPACE/crashes"
+
+          live_count=$(find "$LIVE_CORPUS" -maxdepth 1 -type f | wc -l | tr -d ' ')
+          echo "Live corpus count before minimization: $live_count"
+
+          if [ "$live_count" -eq 0 ]; then
+            echo "No generated live corpus files. Cannot generate coverage."
+            echo "exit_code=1" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          rm -rf "$MIN_CORPUS"
+          mkdir -p "$MIN_CORPUS"
+
+          docker run \
+            --platform linux/amd64 \
+            --rm \
+            -v "$OUT_DIR:/out" \
+            -v "$LIVE_CORPUS:/corpus:ro" \
+            -v "$MIN_CORPUS:/min_corpus" \
+            -v "$CRASH_DIR:/crashes" \
+            gcr.io/oss-fuzz-base/base-runner:latest \
+            /bin/bash -lc "
+              set +e
+
+              echo '===== starting libFuzzer corpus minimization ====='
+              /out/$TARGET \
+                -merge=1 \
+                /min_corpus \
+                /corpus \
+                -artifact_prefix=/crashes/ \
+                -print_final_stats=1 \
+                -timeout=60 \
+                -rss_limit_mb=6144
+
+              status=\$?
+              echo \"merge_exit_status=\$status\"
+              exit \$status
+            "
+
+          status=$?
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+
+          min_count=$(find "$MIN_CORPUS" -maxdepth 1 -type f | wc -l | tr -d ' ')
+          echo "minimized_corpus_count=$min_count" >> "$GITHUB_OUTPUT"
+          echo "Minimized generated corpus count: $min_count"
+
+          if [ "$min_count" -eq 0 ]; then
+            echo "No minimized corpus files were generated. Cannot generate coverage."
+            exit 1
+          fi
+
+          exit 0
+
+      - name: Build coverage fuzzers
+        run: |
+          set -euo pipefail
+
+          cd oss-fuzz
+          python3 infra/helper.py build_fuzzers \
+            --sanitizer=coverage \
+            --clean \
+            "$PROJECT"
+
+      - name: Generate HTML coverage report from minimized generated corpus
+        run: |
+          set -euo pipefail
+
+          MIN_CORPUS="$GITHUB_WORKSPACE/corpus/minimized"
+          min_count=$(find "$MIN_CORPUS" -maxdepth 1 -type f | wc -l | tr -d ' ')
+
+          echo "Minimized generated corpus count for coverage: $min_count"
+
+          if [ "$min_count" -eq 0 ]; then
+            echo "No minimized corpus files. Refusing to generate coverage."
+            exit 1
+          fi
+
+          cd oss-fuzz
+
+          python3 infra/helper.py coverage \
+            --no-corpus-download \
+            --no-serve \
+            --fuzz-target="$TARGET" \
+            --corpus-dir="$MIN_CORPUS" \
+            "$PROJECT"
+
+          cp -R "build/out/$PROJECT/report/." "$GITHUB_WORKSPACE/coverage-html/"
+
+      - name: Count crash artifacts
+        id: count_crashes
+        if: always()
+        run: |
+          set -euo pipefail
+
+          if [ -d "$GITHUB_WORKSPACE/crashes" ]; then
+            finding_count=$(find "$GITHUB_WORKSPACE/crashes" -maxdepth 1 -type f | wc -l | tr -d ' ')
+          else
+            finding_count=0
+          fi
+
+          echo "finding_count=$finding_count" >> "$GITHUB_OUTPUT"
+          echo "Crash/failure artifact count: $finding_count"
+
+          if [ "$finding_count" -ne 0 ]; then
+            find "$GITHUB_WORKSPACE/crashes" -maxdepth 1 -type f -print | sort
+          fi
+
+      - name: Upload crash artifacts
+        if: always() && steps.count_crashes.outputs.finding_count != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: json-java-crashes
+          path: crashes
+          retention-days: 7
+
+      - name: Upload coverage HTML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: json-java-generated-corpus-coverage-html
+          path: coverage-html
+          retention-days: 7
+          compression-level: 0
+
+      - name: Fail if fuzzing or minimization failed
+        if: steps.fuzz.outputs.exit_code != '0' || steps.minimize.outputs.exit_code != '0'
+        run: |
+          echo "Fuzzing or generated corpus minimization returned non-zero."
+          echo "fuzz_exit_code=${{ steps.fuzz.outputs.exit_code }}"
+          echo "minimize_exit_code=${{ steps.minimize.outputs.exit_code }}"
+          exit 1
+
+      - name: Fail if crash artifacts were found
+        if: steps.count_crashes.outputs.finding_count != '0'
+        run: |
+          echo "Jazzer produced crash, timeout, OOM, or failure artifacts."
+          echo "Download the json-java-crashes artifact."
+          exit 1
