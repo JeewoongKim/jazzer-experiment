@@ -18,6 +18,12 @@ on:
         required: true
         default: "1"
         type: string
+      dictionary_file:
+        description: "Dictionary file under fuzz/"
+        required: true
+        default: "json.dict"
+        type: string
+
       sanitizer:
         description: "Sanitizer used for corpus generation"
         required: true
@@ -67,6 +73,22 @@ jobs:
 
           echo "===== json-java project files ====="
           find "$GITHUB_WORKSPACE/oss-fuzz/projects/${PROJECT}" -maxdepth 1 -type f | sort
+
+      - name: Check dictionary file
+        run: |
+          set -euo pipefail
+      
+          DICT_FILE="$GITHUB_WORKSPACE/experiment/fuzz/${{ inputs.dictionary_file }}"
+      
+          if [ ! -s "$DICT_FILE" ]; then
+            echo "Dictionary file was not found or is empty: $DICT_FILE"
+            echo "Files under experiment/fuzz:"
+            find "$GITHUB_WORKSPACE/experiment/fuzz" -maxdepth 1 -type f -print | sort
+            exit 1
+          fi
+      
+          echo "Dictionary file: $DICT_FILE"
+          sed -n '1,80p' "$DICT_FILE"
 
       - name: Patch json-java build.sh to create unit-test seed corpus
         run: |
@@ -218,6 +240,7 @@ jobs:
           OUT_DIR="$GITHUB_WORKSPACE/oss-fuzz/build/out/$PROJECT"
           LIVE_CORPUS="$GITHUB_WORKSPACE/corpus/live"
           CRASH_DIR="$GITHUB_WORKSPACE/crashes"
+          DICT_FILE="$GITHUB_WORKSPACE/experiment/fuzz/${{ inputs.dictionary_file }}"
 
           docker run \
             --platform linux/amd64 \
@@ -225,6 +248,7 @@ jobs:
             -v "$OUT_DIR:/out" \
             -v "$LIVE_CORPUS:/corpus" \
             -v "$CRASH_DIR:/crashes" \
+            -v "$DICT_FILE:/dict/${{ inputs.dictionary_file }}:ro" \
             gcr.io/oss-fuzz-base/base-runner:latest \
             /bin/bash -lc "
               set +e
@@ -239,6 +263,7 @@ jobs:
               /out/$TARGET \
                 /corpus \
                 -fork=${{ inputs.fork_processes }} \
+                -dict=/dict/${{ inputs.dictionary_file }} \
                 -ignore_crashes=1 \
                 -ignore_timeouts=1 \
                 -ignore_ooms=1 \
@@ -276,6 +301,7 @@ jobs:
           LIVE_CORPUS="$GITHUB_WORKSPACE/corpus/live"
           MIN_CORPUS="$GITHUB_WORKSPACE/corpus/minimized"
           CRASH_DIR="$GITHUB_WORKSPACE/crashes"
+          DICT_FILE="$GITHUB_WORKSPACE/experiment/fuzz/${{ inputs.dictionary_file }}"
 
           live_count=$(find "$LIVE_CORPUS" -maxdepth 1 -type f | wc -l | tr -d ' ')
           echo "Live corpus count before minimization: $live_count"
@@ -296,6 +322,7 @@ jobs:
             -v "$LIVE_CORPUS:/corpus:ro" \
             -v "$MIN_CORPUS:/min_corpus" \
             -v "$CRASH_DIR:/crashes" \
+            -v "$DICT_FILE:/dict/${{ inputs.dictionary_file }}:ro" \
             gcr.io/oss-fuzz-base/base-runner:latest \
             /bin/bash -lc "
               set +e
@@ -305,6 +332,7 @@ jobs:
                 -merge=1 \
                 /min_corpus \
                 /corpus \
+                -dict=/dict/${{ inputs.dictionary_file }} \
                 -ignore_crashes=1 \
                 -ignore_timeouts=1 \
                 -ignore_ooms=1 \
