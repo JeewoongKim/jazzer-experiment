@@ -68,6 +68,56 @@ jobs:
           echo "===== json-java project files ====="
           find "$GITHUB_WORKSPACE/oss-fuzz/projects/${PROJECT}" -maxdepth 1 -type f | sort
 
+      - name: Patch json-java build.sh to create unit-test seed corpus
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          build_sh = Path("oss-fuzz/projects/json-java/build.sh")
+          text = build_sh.read_text()
+
+          seed_block = r'''
+          # Create an initial seed corpus for JsonRoundTripFuzzer from
+          # JSON-java's upstream unit-test JSON resources.
+          python3 - <<'PY_SEED'
+          import os
+          from pathlib import Path
+          from zipfile import ZipFile, ZIP_DEFLATED
+
+          resources = Path("src/test/resources")
+          json_files = sorted(resources.rglob("*.json"))
+
+          if not json_files:
+              raise SystemExit("No JSON files found in src/test/resources/**/*.json")
+
+          out = Path(os.environ["OUT"]) / "JsonRoundTripFuzzer_seed_corpus.zip"
+
+          with ZipFile(out, "w", ZIP_DEFLATED) as corpus:
+              for json_file in json_files:
+                  relative = json_file.relative_to(resources)
+                  archive_name = str(relative).replace("/", "__")
+                  corpus.write(json_file, archive_name)
+
+          print(f"Created {out} with {len(json_files)} JSON seed files")
+          PY_SEED
+
+          '''
+
+          marker = "cd src/main/java"
+
+          if "JsonRoundTripFuzzer_seed_corpus.zip" not in text:
+              if marker not in text:
+                  raise SystemExit("Could not find insertion point in build.sh")
+              text = text.replace(marker, seed_block + "\n" + marker, 1)
+              build_sh.write_text(text)
+
+          print("===== patched build.sh =====")
+          print(build_sh.read_text())
+          PY
+
+
       - name: Build OSS-Fuzz image
         run: |
           set -euo pipefail
@@ -83,12 +133,13 @@ jobs:
             --clean \
             "$PROJECT"
 
-      - name: Check target exists
+      - name: Check target exists and seed corpus
         run: |
           set -euo pipefail
 
           OUT_DIR="$GITHUB_WORKSPACE/oss-fuzz/build/out/$PROJECT"
           TARGET_PATH="$OUT_DIR/$TARGET"
+		  SEED_ZIP="$OUT_DIR/${TARGET}_seed_corpus.zip"
 
           if [ ! -f "$TARGET_PATH" ]; then
             echo "Target binary was not created: $TARGET_PATH"
@@ -97,8 +148,34 @@ jobs:
             exit 1
           fi
 
+          if [ ! -s "$SEED_ZIP" ]; then
+            echo "Seed corpus zip was not created or is empty: $SEED_ZIP"
+            echo "Build output:"
+            ls -lh "$OUT_DIR"
+            exit 1
+          fi
+
+          json_count=$(python3 - <<PY
+          from zipfile import ZipFile
+
+          seed_zip = "$SEED_ZIP"
+
+          with ZipFile(seed_zip) as z:
+              print(len([n for n in z.namelist() if n.endswith(".json")]))
+          PY
+          )
+
           echo "Target: $TARGET"
           ls -lh "$TARGET_PATH"
+          echo "Seed corpus: $SEED_ZIP"
+          echo "JSON seed count: $json_count"
+
+          if [ "$json_count" -eq 0 ]; then
+            echo "No .json files were added to the seed corpus."
+            exit 1
+          fi
+
+          unzip -l "$SEED_ZIP"
 
       - name: Check build
         run: |
@@ -106,7 +183,7 @@ jobs:
           cd oss-fuzz
           python3 infra/helper.py check_build "$PROJECT" "$TARGET"
 
-      - name: Prepare empty corpus and output directories
+      - name: Prepare corpus and output directories
         run: |
           set -euo pipefail
 
@@ -119,8 +196,18 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/crashes"
           mkdir -p "$GITHUB_WORKSPACE/coverage-html"
 
+          SEED_ZIP="$GITHUB_WORKSPACE/oss-fuzz/build/out/$PROJECT/${TARGET}_seed_corpus.zip"
+
+          if [ ! -s "$SEED_ZIP" ]; then
+            echo "Seed corpus zip was not found or is empty: $SEED_ZIP"
+            exit 1
+          fi
+
+          unzip -q "$SEED_ZIP" -d "$GITHUB_WORKSPACE/corpus/live"
+
           echo "Initial live corpus count:"
           find "$GITHUB_WORKSPACE/corpus/live" -maxdepth 1 -type f | wc -l
+          find "$GITHUB_WORKSPACE/corpus/live" -maxdepth 1 -type f | sort
 
       - name: Run Jazzer/libFuzzer fork-mode fuzzing
         id: fuzz
@@ -148,7 +235,7 @@ jobs:
               echo '===== initial corpus count ====='
               find /corpus -maxdepth 1 -type f | wc -l
 
-              echo '===== starting Jazzer/libFuzzer fork-mode fuzzing without seed corpus ====='
+              echo '===== starting Jazzer/libFuzzer fork-mode fuzzing with unit-test seed corpus ====='
               /out/$TARGET \
                 /corpus \
                 -fork=${{ inputs.fork_processes }} \
@@ -303,7 +390,7 @@ jobs:
         if: always() && steps.count_crashes.outputs.finding_count != '0'
         uses: actions/upload-artifact@v4
         with:
-          name: json-java-roundtrip-crashes
+          name: json-java-roundtrip-unit-seed-crashes
           path: crashes
           retention-days: 7
 
@@ -311,7 +398,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: json-java-roundtrip-coverage-html
+          name: json-java-roundtrip-unit-seed-coverage-html
           path: coverage-html
           retention-days: 7
           compression-level: 0
@@ -328,5 +415,5 @@ jobs:
         if: steps.count_crashes.outputs.finding_count != '0'
         run: |
           echo "Jazzer produced crash, timeout, OOM, or failure artifacts."
-          echo "Download the json-java-roundtrip-crashes artifact."
+          echo "Download the json-java-roundtrip-unit-seed-crashes artifact."
           exit 1
