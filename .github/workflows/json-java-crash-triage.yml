@@ -1,0 +1,399 @@
+name: JSON-java crash triage fuzzing
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: "Fuzzing duration in seconds"
+        required: true
+        default: "600"
+        type: string
+      seed:
+        description: "libFuzzer random seed"
+        required: true
+        default: "0"
+        type: string
+      seed_corpus_dir:
+        description: "Seed corpus directory in this repository"
+        required: true
+        default: "corpus/initial"
+        type: string
+      dictionary_file:
+        description: "Optional dictionary file under fuzz/"
+        required: true
+        default: "json.dict"
+        type: string
+      timeout_seconds:
+        description: "Per-input timeout"
+        required: true
+        default: "60"
+        type: string
+      rss_limit_mb:
+        description: "RSS limit in MB"
+        required: true
+        default: "6144"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      PROJECT: json-java
+      TARGET: JsonRoundTripFuzzer
+
+    steps:
+      - name: Checkout experiment repository
+        uses: actions/checkout@v4
+        with:
+          path: experiment
+
+      - name: Checkout OSS-Fuzz
+        uses: actions/checkout@v4
+        with:
+          repository: google/oss-fuzz
+          path: oss-fuzz
+
+      - name: Add fuzz target to OSS-Fuzz project
+        run: |
+          set -euo pipefail
+
+          SRC="$GITHUB_WORKSPACE/experiment/fuzz/${TARGET}.java"
+          DST="$GITHUB_WORKSPACE/oss-fuzz/projects/${PROJECT}/${TARGET}.java"
+
+          if [ ! -f "$SRC" ]; then
+            echo "Fuzz target not found: $SRC"
+            exit 1
+          fi
+
+          cp "$SRC" "$DST"
+
+      - name: Prepare seed corpus and artifact directories
+        run: |
+          set -euo pipefail
+
+          SRC_CORPUS="$GITHUB_WORKSPACE/experiment/${{ inputs.seed_corpus_dir }}"
+          LIVE_CORPUS="$GITHUB_WORKSPACE/corpus/live"
+          ARTIFACT_DIR="$GITHUB_WORKSPACE/triage-artifact"
+          CRASH_DIR="$ARTIFACT_DIR/crashes"
+          REPLAY_DIR="$ARTIFACT_DIR/replay-raw-stdout-stderr"
+
+          mkdir -p "$LIVE_CORPUS"
+          mkdir -p "$CRASH_DIR"
+          mkdir -p "$REPLAY_DIR"
+
+          if [ ! -d "$SRC_CORPUS" ]; then
+            echo "Seed corpus directory not found: $SRC_CORPUS"
+            echo "Repository tree:"
+            find "$GITHUB_WORKSPACE/experiment" -maxdepth 4 -print | sort
+            exit 1
+          fi
+
+          seed_count=$(find "$SRC_CORPUS" -maxdepth 1 -type f | wc -l | tr -d ' ')
+
+          if [ "$seed_count" -eq 0 ]; then
+            echo "Seed corpus directory is empty: $SRC_CORPUS"
+            exit 1
+          fi
+
+          cp "$SRC_CORPUS"/* "$LIVE_CORPUS"/
+
+          echo "Prepared seed corpus:"
+          echo "  source=$SRC_CORPUS"
+          echo "  live=$LIVE_CORPUS"
+          echo "  count=$(find "$LIVE_CORPUS" -maxdepth 1 -type f | wc -l | tr -d ' ')"
+
+      - name: Build OSS-Fuzz image
+        run: |
+          set -euo pipefail
+
+          cd oss-fuzz
+          python3 infra/helper.py build_image --pull "$PROJECT"
+
+      - name: Build fuzzers
+        run: |
+          set -euo pipefail
+
+          cd oss-fuzz
+          python3 infra/helper.py build_fuzzers \
+            --sanitizer=address \
+            --clean \
+            "$PROJECT"
+
+      - name: Check build
+        run: |
+          set -euo pipefail
+
+          cd oss-fuzz
+          python3 infra/helper.py check_build "$PROJECT" "$TARGET"
+
+      - name: Run no-fork crash triage fuzzing
+        id: fuzz
+        continue-on-error: true
+        run: |
+          set +e
+
+          OUT_DIR="$GITHUB_WORKSPACE/oss-fuzz/build/out/$PROJECT"
+          LIVE_CORPUS="$GITHUB_WORKSPACE/corpus/live"
+          ARTIFACT_DIR="$GITHUB_WORKSPACE/triage-artifact"
+          CRASH_DIR="$ARTIFACT_DIR/crashes"
+          FUZZ_LOG="$ARTIFACT_DIR/fuzzing-stdout-stderr.log"
+
+          DICT_FILE="$GITHUB_WORKSPACE/experiment/fuzz/${{ inputs.dictionary_file }}"
+          DICT_ARG=""
+
+          if [ -s "$DICT_FILE" ]; then
+            DICT_ARG="-dict=/dict/${{ inputs.dictionary_file }}"
+            DICT_MOUNT=(-v "$DICT_FILE:/dict/${{ inputs.dictionary_file }}:ro")
+          else
+            DICT_MOUNT=()
+          fi
+
+          docker run \
+            --platform linux/amd64 \
+            --rm \
+            -v "$OUT_DIR:/out:ro" \
+            -v "$LIVE_CORPUS:/corpus" \
+            -v "$CRASH_DIR:/crashes" \
+            "${DICT_MOUNT[@]}" \
+            gcr.io/oss-fuzz-base/base-runner:latest \
+            /out/$TARGET \
+              /corpus \
+              $DICT_ARG \
+              -max_total_time=${{ inputs.duration_seconds }} \
+              -seed=${{ inputs.seed }} \
+              -artifact_prefix=/crashes/ \
+              -print_final_stats=1 \
+              -timeout=${{ inputs.timeout_seconds }} \
+              -rss_limit_mb=${{ inputs.rss_limit_mb }} \
+            > "$FUZZ_LOG" 2>&1
+
+          status=$?
+
+          echo "$status" > "$ARTIFACT_DIR/fuzzing-exit-code.txt"
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+
+          exit 0
+
+      - name: Replay generated crash inputs
+        id: replay
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e
+
+          OUT_DIR="$GITHUB_WORKSPACE/oss-fuzz/build/out/$PROJECT"
+          ARTIFACT_DIR="$GITHUB_WORKSPACE/triage-artifact"
+          CRASH_DIR="$ARTIFACT_DIR/crashes"
+          REPLAY_DIR="$ARTIFACT_DIR/replay-raw-stdout-stderr"
+          RESULT_TSV="$ARTIFACT_DIR/replay-results.tsv"
+
+          mkdir -p "$REPLAY_DIR"
+
+          printf 'file\tsize_bytes\tsha1\tsha256\texit_code\treproduced\traw_stdout_stderr\n' > "$RESULT_TSV"
+
+          total_candidates=0
+          replay_reproduced=0
+          replay_not_reproduced=0
+
+          for testcase in "$CRASH_DIR"/crash-* "$CRASH_DIR"/timeout-* "$CRASH_DIR"/oom-*; do
+            [ -f "$testcase" ] || continue
+
+            total_candidates=$((total_candidates + 1))
+
+            name="$(basename "$testcase")"
+            safe_name="$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '_')"
+            raw_log="$REPLAY_DIR/${safe_name}.log"
+
+            size="$(wc -c < "$testcase" | tr -d ' ')"
+            sha1="$(sha1sum "$testcase" | awk '{print $1}')"
+            sha256="$(sha256sum "$testcase" | awk '{print $1}')"
+
+            docker run \
+              --platform linux/amd64 \
+              --rm \
+              -v "$OUT_DIR:/out:ro" \
+              -v "$testcase:/testcase:ro" \
+              gcr.io/oss-fuzz-base/base-runner:latest \
+              /out/$TARGET \
+                /testcase \
+                -runs=1 \
+                -timeout=${{ inputs.timeout_seconds }} \
+                -rss_limit_mb=${{ inputs.rss_limit_mb }} \
+                -print_final_stats=1 \
+              > "$raw_log" 2>&1
+
+            status=$?
+
+            if [ "$status" -eq 0 ]; then
+              reproduced="no"
+              replay_not_reproduced=$((replay_not_reproduced + 1))
+            else
+              reproduced="yes"
+              replay_reproduced=$((replay_reproduced + 1))
+            fi
+
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$name" "$size" "$sha1" "$sha256" "$status" "$reproduced" "replay-raw-stdout-stderr/${safe_name}.log" \
+              >> "$RESULT_TSV"
+          done
+
+          {
+            echo "total_candidates=$total_candidates"
+            echo "replay_reproduced=$replay_reproduced"
+            echo "replay_not_reproduced=$replay_not_reproduced"
+          } > "$ARTIFACT_DIR/replay-summary.env"
+
+          echo "total_candidates=$total_candidates" >> "$GITHUB_OUTPUT"
+          echo "replay_reproduced=$replay_reproduced" >> "$GITHUB_OUTPUT"
+          echo "replay_not_reproduced=$replay_not_reproduced" >> "$GITHUB_OUTPUT"
+
+          exit 0
+
+      - name: Create bug report summary
+        if: always()
+        run: |
+          set -euo pipefail
+
+          ARTIFACT_DIR="$GITHUB_WORKSPACE/triage-artifact"
+          REPORT="$ARTIFACT_DIR/bug-report.md"
+          RESULT_TSV="$ARTIFACT_DIR/replay-results.tsv"
+          FUZZ_EXIT_CODE_FILE="$ARTIFACT_DIR/fuzzing-exit-code.txt"
+          REPLAY_SUMMARY="$ARTIFACT_DIR/replay-summary.env"
+          OUT_DIR="$GITHUB_WORKSPACE/oss-fuzz/build/out/$PROJECT"
+          TARGET_PATH="$OUT_DIR/$TARGET"
+          LIVE_CORPUS="$GITHUB_WORKSPACE/corpus/live"
+
+          fuzz_exit_code="unknown"
+          if [ -f "$FUZZ_EXIT_CODE_FILE" ]; then
+            fuzz_exit_code="$(cat "$FUZZ_EXIT_CODE_FILE")"
+          fi
+
+          total_candidates="0"
+          replay_reproduced="0"
+          replay_not_reproduced="0"
+
+          if [ -f "$REPLAY_SUMMARY" ]; then
+            . "$REPLAY_SUMMARY"
+          fi
+
+          {
+            echo "# json-java crash triage report"
+            echo
+            echo "## Summary"
+            echo
+            echo "- Project: \`$PROJECT\`"
+            echo "- Fuzz target: \`$TARGET\`"
+            echo "- Mode: no-fork crash triage fuzzing"
+            echo "- Sanitizer: \`address\`"
+            echo "- Duration: \`${{ inputs.duration_seconds }}\` seconds"
+            echo "- Seed: \`${{ inputs.seed }}\`"
+            echo "- Seed corpus directory: \`${{ inputs.seed_corpus_dir }}\`"
+            echo "- Seed corpus count: \`$(find "$LIVE_CORPUS" -maxdepth 1 -type f | wc -l | tr -d ' ')\`"
+            echo "- Dictionary file: \`${{ inputs.dictionary_file }}\`"
+            echo "- Fuzzing exit code: \`$fuzz_exit_code\`"
+            echo "- Crash candidates generated: \`$total_candidates\`"
+            echo "- Replay reproduced: \`$replay_reproduced\`"
+            echo "- Replay not reproduced: \`$replay_not_reproduced\`"
+            echo
+            echo "The original fuzzing stdout/stderr is stored in:"
+            echo
+            echo "\`\`\`text"
+            echo "fuzzing-stdout-stderr.log"
+            echo "\`\`\`"
+            echo
+            echo "Each generated crash candidate was replayed once. The raw stdout/stderr from each replay is stored under:"
+            echo
+            echo "\`\`\`text"
+            echo "replay-raw-stdout-stderr/"
+            echo "\`\`\`"
+            echo
+            echo "## Execution environment"
+            echo
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Date UTC | $(date -u '+%Y-%m-%dT%H:%M:%SZ') |"
+            echo "| GitHub runner OS | ${RUNNER_OS:-unknown} |"
+            echo "| GitHub runner architecture | ${RUNNER_ARCH:-unknown} |"
+            echo "| uname | $(uname -a | sed 's/|/-/g') |"
+            echo "| Docker | $(docker --version | sed 's/|/-/g') |"
+            echo "| OSS-Fuzz commit | $(git -C "$GITHUB_WORKSPACE/oss-fuzz" rev-parse HEAD) |"
+            echo "| Experiment repo commit | $(git -C "$GITHUB_WORKSPACE/experiment" rev-parse HEAD) |"
+            echo "| Timeout | ${{ inputs.timeout_seconds }} seconds |"
+            echo "| RSS limit | ${{ inputs.rss_limit_mb }} MB |"
+
+            if [ -f "$TARGET_PATH" ]; then
+              echo "| Target wrapper size | $(wc -c < "$TARGET_PATH" | tr -d ' ') bytes |"
+              echo "| Target wrapper SHA-256 | $(sha256sum "$TARGET_PATH" | awk '{print $1}') |"
+            fi
+
+            echo
+            echo "## Fuzzing command"
+            echo
+            echo "The fuzzer was run without \`-fork\` and without \`-ignore_crashes\`, \`-ignore_timeouts\`, or \`-ignore_ooms\`."
+            echo
+            echo "\`\`\`bash"
+            echo "/out/$TARGET /corpus \\"
+            echo "  -max_total_time=${{ inputs.duration_seconds }} \\"
+            echo "  -seed=${{ inputs.seed }} \\"
+            echo "  -artifact_prefix=/crashes/ \\"
+            echo "  -print_final_stats=1 \\"
+            echo "  -timeout=${{ inputs.timeout_seconds }} \\"
+            echo "  -rss_limit_mb=${{ inputs.rss_limit_mb }}"
+            echo "\`\`\`"
+            echo
+            echo "If \`fuzzing-stdout-stderr.log\` contains \`StackOverflowError\`, \`OutOfMemoryError\`, \`AssertionError\`, \`ERROR: libFuzzer\`, \`SUMMARY\`, or \`Test unit written to\`, use that section as the primary evidence."
+            echo
+            echo "## Replay command"
+            echo
+            echo "Each generated crash candidate was replayed with:"
+            echo
+            echo "\`\`\`bash"
+            echo "/out/$TARGET /testcase \\"
+            echo "  -runs=1 \\"
+            echo "  -timeout=${{ inputs.timeout_seconds }} \\"
+            echo "  -rss_limit_mb=${{ inputs.rss_limit_mb }} \\"
+            echo "  -print_final_stats=1"
+            echo "\`\`\`"
+            echo
+            echo "## Replay results"
+            echo
+            echo "| File | Size | SHA-1 | SHA-256 | Exit code | Reproduced | Raw stdout/stderr |"
+            echo "|---|---:|---|---|---:|---:|---|"
+
+            if [ -f "$RESULT_TSV" ]; then
+              tail -n +2 "$RESULT_TSV" | while IFS=$'\t' read -r file size sha1 sha256 exit_code reproduced raw_path; do
+                echo "| \`$file\` | $size | \`$sha1\` | \`$sha256\` | $exit_code | $reproduced | \`$raw_path\` |"
+              done
+            fi
+
+            echo
+            echo "## Triage guidance"
+            echo
+            echo "- If fuzzing stdout/stderr shows a clear Java exception or libFuzzer error, the fuzzing log is the primary failure evidence."
+            echo "- If replay also reproduces non-zero exit, the issue is a confirmed input-level reproducer."
+            echo "- If fuzzing reports a crash but replay exits 0, treat it as a crash candidate, not a confirmed upstream bug."
+            echo "- Do not publish crash inputs publicly until the security impact is understood."
+          } > "$REPORT"
+
+      - name: Upload crash triage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: json-java-crash-triage-artifact
+          path: triage-artifact
+          retention-days: 7
+          compression-level: 9
+
+      - name: Print final result
+        if: always()
+        run: |
+          echo "fuzzing_exit_code=${{ steps.fuzz.outputs.exit_code }}"
+          echo "crash_candidates=${{ steps.replay.outputs.total_candidates }}"
+          echo "replay_reproduced=${{ steps.replay.outputs.replay_reproduced }}"
+          echo "replay_not_reproduced=${{ steps.replay.outputs.replay_not_reproduced }}"
+          echo "Download artifact: json-java-crash-triage-artifact"
