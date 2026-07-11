@@ -139,7 +139,7 @@ jobs:
 
           OUT_DIR="$GITHUB_WORKSPACE/oss-fuzz/build/out/$PROJECT"
           TARGET_PATH="$OUT_DIR/$TARGET"
-		  SEED_ZIP="$OUT_DIR/${TARGET}_seed_corpus.zip"
+          SEED_ZIP="$OUT_DIR/${TARGET}_seed_corpus.zip"
 
           if [ ! -f "$TARGET_PATH" ]; then
             echo "Target binary was not created: $TARGET_PATH"
